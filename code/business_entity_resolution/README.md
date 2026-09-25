@@ -61,7 +61,7 @@ python src/main.py \
     --output-dir ../../output \
     --model-path models/lgbm_matcher.joblib \
     --top-k 12 \
-    --threshold 0.70
+    --threshold 0.80
 ```
 
 ### Outputs Generated:

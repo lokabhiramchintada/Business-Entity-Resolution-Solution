@@ -1,310 +1,1239 @@
+# src/pipeline.py
+
 import os
 import sys
 import time
 import math
+
 import duckdb
 import numpy as np
 import pandas as pd
-from tqdm import tqdm
+
 from collections import defaultdict
 
-from .preprocessing import clean_tokens, clean_compact_name, extract_digits, extract_addr_tokens
 from .blocking import CandidateGenerator
 from .features import extract_pair_features, FEATURE_NAMES
-from .model import train_matching_model, load_matching_model, compute_macro_f05
+from .model import (
+    train_matching_model,
+    load_matching_model,
+    compute_macro_f05,
+)
+
 
 class EntityResolutionPipeline:
-    def __init__(self, top_k_candidates=12, threshold=0.70):
-        self.top_k_candidates = top_k_candidates
-        self.threshold = threshold
+
+    def __init__(
+        self,
+        top_k_candidates=24,
+        threshold=0.80,
+        threshold_min=0.50,
+        threshold_max=0.99,
+        threshold_step=0.01,
+    ):
+        self.top_k_candidates = int(top_k_candidates)
+
+        self.threshold = float(threshold)
+
+        self.threshold_min = float(threshold_min)
+        self.threshold_max = float(threshold_max)
+        self.threshold_step = float(threshold_step)
+
         self.model = None
 
-    def train(self, data_dir, model_save_path, n_train_samples=40000, n_val_samples=5000):
-        """Train LightGBM matcher on a balanced sample from train split."""
-        print(f"=== Training Pipeline (n_samples={n_train_samples}) ===")
-        t0 = time.time()
-        con = duckdb.connect()
-        
-        # Sample training and validation S1 entities
-        total_samples = n_train_samples + n_val_samples
-        print(f"Sampling {total_samples} S1 entities from {data_dir}/train/train_source1.tsv...")
-        sample_s1 = con.execute(f"""
-            SELECT entity_id, business_name, business_address, country
-            FROM read_csv('{data_dir}/train/train_source1.tsv', delim='\t', header=True)
-            USING SAMPLE {total_samples} (reservoir, 42);
-        """).df()
-        
-        train_s1 = sample_s1.iloc[:n_train_samples].copy()
-        val_s1 = sample_s1.iloc[n_train_samples:].copy()
-        
-        # Load ground truth for sampled entities
-        con.register('sample_s1_df', sample_s1[['entity_id']])
-        gt_df = con.execute(f"""
+    # ------------------------------------------------------------------
+    # DATA LOADING
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _read_source(con, path):
+        return con.execute(
+            f"""
+            SELECT
+                entity_id,
+                business_name,
+                business_address,
+                country
+            FROM read_csv(
+                '{path}',
+                delim='\\t',
+                header=True
+            )
+            """
+        ).df()
+
+    @staticmethod
+    def _load_ground_truth(con, data_dir, s1_ids):
+        """
+        Load ground truth only for the requested S1 IDs.
+        """
+
+        if not s1_ids:
+            return defaultdict(set)
+
+        s1_df = pd.DataFrame(
+            {
+                "entity_id": list(s1_ids)
+            }
+        )
+
+        con.register("requested_s1", s1_df)
+
+        gt_df = con.execute(
+            f"""
             WITH unnested AS (
-                SELECT 
+                SELECT
                     g.source1_entity_id,
-                    unnest(string_split(g.matched_entity_ids, ',')) AS matched_id
-                FROM read_csv('{data_dir}/train/train_ground_truth.tsv', delim='\t', header=True) g
-                JOIN sample_s1_df s ON g.source1_entity_id = s.entity_id
-                WHERE g.matched_entity_ids IS NOT NULL AND g.matched_entity_ids != ''
+                    unnest(
+                        string_split(
+                            g.matched_entity_ids,
+                            ','
+                        )
+                    ) AS matched_id
+                FROM read_csv(
+                    '{data_dir}/train/train_ground_truth.tsv',
+                    delim='\\t',
+                    header=True
+                ) g
+                JOIN requested_s1 s
+                    ON g.source1_entity_id = s.entity_id
+                WHERE
+                    g.matched_entity_ids IS NOT NULL
+                    AND g.matched_entity_ids != ''
             )
-            SELECT * FROM unnested;
-        """).df()
-        
+            SELECT
+                source1_entity_id,
+                matched_id
+            FROM unnested
+            """
+        ).df()
+
         gt_dict = defaultdict(set)
-        for _, r in gt_df.iterrows():
-            gt_dict[r['source1_entity_id']].add(r['matched_id'])
-            
-        all_gt_matched_ids = set(gt_df['matched_id'].values)
-        con.register('matched_ids_df', pd.DataFrame({'entity_id': list(all_gt_matched_ids)}))
-        
-        # Load matched targets + negative distractors
-        print("Loading training targets (true matches + negative distractors)...")
-        targets_df = con.execute(f"""
-            WITH matched_s2 AS (
-                SELECT s.entity_id, s.business_name, s.business_address, s.country
-                FROM read_csv('{data_dir}/train/train_source2.tsv', delim='\t', header=True) s
-                JOIN matched_ids_df m ON s.entity_id = m.entity_id
-            ),
-            matched_s3 AS (
-                SELECT s.entity_id, s.business_name, s.business_address, s.country
-                FROM read_csv('{data_dir}/train/train_source3.tsv', delim='\t', header=True) s
-                JOIN matched_ids_df m ON s.entity_id = m.entity_id
-            ),
-            distractors_s2 AS (
-                SELECT entity_id, business_name, business_address, country
-                FROM read_csv('{data_dir}/train/train_source2.tsv', delim='\t', header=True)
-                USING SAMPLE 150000 (reservoir, 99)
-            ),
-            distractors_s3 AS (
-                SELECT entity_id, business_name, business_address, country
-                FROM read_csv('{data_dir}/train/train_source3.tsv', delim='\t', header=True)
-                USING SAMPLE 150000 (reservoir, 99)
+
+        for _, row in gt_df.iterrows():
+            gt_dict[row["source1_entity_id"]].add(
+                row["matched_id"]
             )
-            SELECT * FROM matched_s2
-            UNION ALL SELECT * FROM matched_s3
-            UNION ALL SELECT * FROM distractors_s2
-            UNION ALL SELECT * FROM distractors_s3;
-        """).df().drop_duplicates(subset=['entity_id']).reset_index(drop=True)
-        
-        print(f"Loaded {len(targets_df)} target records for training.")
-        
-        # Build candidate generators partitioned by country
-        country_generators = {}
-        for country in ['US', 'India']:
-            c_targets = targets_df[targets_df['country'] == country].reset_index(drop=True)
-            if len(c_targets) > 0:
-                gen = CandidateGenerator(max_cand_per_key=100, default_top_k=self.top_k_candidates)
-                gen.fit(c_targets)
-                country_generators[country] = gen
-                
-        # Generate training dataset
-        print("Generating training candidate pairs and computing features...")
-        X_train, y_train = [], []
-        
-        for _, row in train_s1.iterrows():
-            c = row['country']
-            if c not in country_generators:
+
+        return gt_dict
+
+    # ------------------------------------------------------------------
+    # CANDIDATE GENERATOR
+    # ------------------------------------------------------------------
+
+    def _build_country_generators(self, targets_df):
+        """
+        Build candidate generators using the COMPLETE target population.
+
+        This is intentionally different from the previous implementation,
+        which used only matched records + random distractors.
+        """
+
+        generators = {}
+
+        countries = [
+            c
+            for c in targets_df["country"].dropna().unique()
+        ]
+
+        print(
+            f"Building candidate generators for "
+            f"{len(countries)} countries..."
+        )
+
+        for country in countries:
+
+            country_targets = targets_df[
+                targets_df["country"] == country
+            ].reset_index(drop=True)
+
+            if len(country_targets) == 0:
                 continue
-            gen = country_generators[c]
-            s1_id = row['entity_id']
-            s1_name = row['business_name']
-            s1_addr = row['business_address']
-            
-            cands = gen.query(s1_name, s1_addr, top_k=self.top_k_candidates)
-            true_targets = gt_dict.get(s1_id, set())
-            
-            for tid_idx in cands:
-                tgt_id = gen.t_ids[tid_idx]
-                tgt_name = gen.t_names[tid_idx]
-                tgt_addr = gen.t_addrs[tid_idx]
-                
-                feats = extract_pair_features(s1_name, s1_addr, tgt_name, tgt_addr, tgt_id)
-                label = 1 if tgt_id in true_targets else 0
-                
-                X_train.append(feats)
-                y_train.append(label)
-                
-        print(f"Training dataset: {len(X_train)} candidate pairs ({sum(y_train)} positive, {len(y_train)-sum(y_train)} negative).")
-        
-        # Train model
-        self.model = train_matching_model(X_train, y_train, model_path=model_save_path)
-        print(f"Model saved to {model_save_path}.")
-        
-        # Validate and optimize threshold on validation split
-        print("Validating model and tuning threshold on holdout set...")
-        val_gt_dict = {s1: gt_dict[s1] for s1 in val_s1['entity_id'] if s1 in gt_dict}
-        val_s1_ids = list(val_s1['entity_id'].values)
-        
-        val_pair_records = []
-        for _, row in val_s1.iterrows():
-            c = row['country']
-            if c not in country_generators:
+
+            print(
+                f"  Building index for {country}: "
+                f"{len(country_targets):,} targets"
+            )
+
+            generator = CandidateGenerator(
+                max_cand_per_key=100,
+                default_top_k=self.top_k_candidates,
+            )
+
+            generator.fit(country_targets)
+
+            generators[country] = generator
+
+        return generators
+
+    # ------------------------------------------------------------------
+    # CANDIDATE GENERATION
+    # ------------------------------------------------------------------
+
+    def _generate_pairs(
+        self,
+        s1_df,
+        generators,
+        gt_dict=None,
+        collect_features=True,
+        calculate_recall=False,
+    ):
+        """
+        Generate candidate pairs.
+
+        Returns:
+            pair_records
+            candidate_pairs
+            recall_stats
+        """
+
+        if gt_dict is None:
+            gt_dict = {}
+
+        pair_records = []
+        candidate_pairs = {}
+
+        total_true = 0
+        total_found = 0
+
+        for idx, row in s1_df.iterrows():
+
+            s1_id = row["entity_id"]
+            country = row["country"]
+
+            generator = generators.get(country)
+
+            if generator is None:
+                candidate_pairs[s1_id] = []
                 continue
-            gen = country_generators[c]
-            s1_id = row['entity_id']
-            s1_name = row['business_name']
-            s1_addr = row['business_address']
-            
-            cands = gen.query(s1_name, s1_addr, top_k=self.top_k_candidates)
-            for tid_idx in cands:
-                tgt_id = gen.t_ids[tid_idx]
-                tgt_name = gen.t_names[tid_idx]
-                tgt_addr = gen.t_addrs[tid_idx]
-                feats = extract_pair_features(s1_name, s1_addr, tgt_name, tgt_addr, tgt_id)
-                val_pair_records.append((s1_id, tgt_id, feats))
-                
-        if val_pair_records:
-            X_val = np.array([r[2] for r in val_pair_records], dtype=np.float32)
-            val_probs = self.model.predict(X_val)
-            
-            best_thresh, best_f05 = 0.70, 0.0
-            for th in np.arange(0.50, 0.85, 0.05):
-                preds = defaultdict(list)
-                for (s1_id, tgt_id, _), p in zip(val_pair_records, val_probs):
-                    if p >= th:
-                        preds[s1_id].append(tgt_id)
-                score = compute_macro_f05(preds, val_gt_dict, val_s1_ids)
-                if score > best_f05:
-                    best_f05 = score
-                    best_thresh = th
-                    
-            print(f"Validation Optimal Threshold: {best_thresh:.2f} (Macro F_0.5 = {best_f05:.4f})")
-            self.threshold = float(best_thresh)
-            
-        print(f"Training completed in {time.time() - t0:.2f}s.")
+
+            s1_name = row["business_name"]
+            s1_addr = row["business_address"]
+
+            candidates = generator.query(
+                s1_name,
+                s1_addr,
+                top_k=self.top_k_candidates,
+            )
+
+            candidate_ids = []
+
+            true_targets = set(
+                gt_dict.get(s1_id, set())
+            )
+
+            found_targets = set()
+
+            for tid_idx in candidates:
+
+                tgt_id = generator.t_ids[tid_idx]
+
+                candidate_ids.append(tgt_id)
+
+                if tgt_id in true_targets:
+                    found_targets.add(tgt_id)
+
+                if collect_features:
+
+                    tgt_name = generator.t_names[tid_idx]
+                    tgt_addr = generator.t_addrs[tid_idx]
+
+                    features = extract_pair_features(
+                        s1_name,
+                        s1_addr,
+                        tgt_name,
+                        tgt_addr,
+                        tgt_id,
+                    )
+
+                    label = (
+                        1
+                        if tgt_id in true_targets
+                        else 0
+                    )
+
+                    pair_records.append(
+                        (
+                            s1_id,
+                            tgt_id,
+                            features,
+                            label,
+                        )
+                    )
+
+            candidate_pairs[s1_id] = list(
+                dict.fromkeys(candidate_ids)
+            )
+
+            if calculate_recall:
+
+                total_true += len(true_targets)
+                total_found += len(found_targets)
+
+        recall = (
+            total_found / total_true
+            if total_true > 0
+            else 1.0
+        )
+
+        return (
+            pair_records,
+            candidate_pairs,
+            {
+                "true_matches": total_true,
+                "found_matches": total_found,
+                "candidate_recall": recall,
+            },
+        )
+
+    # ------------------------------------------------------------------
+    # THRESHOLD OPTIMIZATION
+    # ------------------------------------------------------------------
+
+    def _find_best_threshold(
+        self,
+        val_pair_records,
+        val_gt_dict,
+        val_s1_ids,
+    ):
+
+        if not val_pair_records:
+            print("No validation pairs.")
+            return self.threshold, 0.0
+
+        X_val = np.asarray(
+            [
+                record[2]
+                for record in val_pair_records
+            ],
+            dtype=np.float32,
+        )
+
+        print(
+            f"Scoring {len(X_val):,} validation pairs..."
+        )
+
+        val_probs = self.model.predict_proba(
+            X_val
+        )
+
+        best_threshold = self.threshold
+        best_score = -1.0
+
+        thresholds = np.arange(
+            self.threshold_min,
+            self.threshold_max + 1e-9,
+            self.threshold_step,
+        )
+
+        print(
+            f"Threshold sweep: "
+            f"{self.threshold_min:.2f} → "
+            f"{self.threshold_max:.2f} "
+            f"step={self.threshold_step:.2f}"
+        )
+
+        for threshold in thresholds:
+
+            preds = defaultdict(list)
+
+            for record, probability in zip(
+                val_pair_records,
+                val_probs,
+            ):
+
+                s1_id = record[0]
+                tgt_id = record[1]
+
+                if probability >= threshold:
+                    preds[s1_id].append(tgt_id)
+
+            score = compute_macro_f05(
+                preds,
+                val_gt_dict,
+                val_s1_ids,
+            )
+
+            print(
+                f"  threshold={threshold:.2f} "
+                f"F0.5={score:.6f}"
+            )
+
+            if score > best_score:
+                best_score = score
+                best_threshold = float(threshold)
+
+        return best_threshold, best_score
+
+    # ------------------------------------------------------------------
+    # TRAIN
+    # ------------------------------------------------------------------
+
+    def train(
+        self,
+        data_dir,
+        model_save_path,
+        n_train_samples=60000,
+        n_val_samples=10000,
+    ):
+
+        print(
+            "\n"
+            "====================================================\n"
+            "TRAINING PIPELINE\n"
+            "===================================================="
+        )
+
+        t0 = time.time()
+
+        con = duckdb.connect()
+
+        train_s1_path = os.path.join(
+            data_dir,
+            "train",
+            "train_source1.tsv",
+        )
+
+        train_s2_path = os.path.join(
+            data_dir,
+            "train",
+            "train_source2.tsv",
+        )
+
+        train_s3_path = os.path.join(
+            data_dir,
+            "train",
+            "train_source3.tsv",
+        )
+
+        # --------------------------------------------------------------
+        # SAMPLE S1
+        # --------------------------------------------------------------
+
+        total_samples = (
+            n_train_samples
+            + n_val_samples
+        )
+
+        print(
+            f"Sampling {total_samples:,} "
+            f"Source-1 entities..."
+        )
+
+        sample_s1 = con.execute(
+            f"""
+            SELECT
+                entity_id,
+                business_name,
+                business_address,
+                country
+            FROM read_csv(
+                '{train_s1_path}',
+                delim='\\t',
+                header=True
+            )
+            USING SAMPLE
+                {total_samples}
+                (reservoir, 42)
+            """
+        ).df()
+
+        if len(sample_s1) < total_samples:
+            raise RuntimeError(
+                "Could not sample requested number of S1 entities."
+            )
+
+        train_s1 = sample_s1.iloc[
+            :n_train_samples
+        ].copy()
+
+        val_s1 = sample_s1.iloc[
+            n_train_samples:
+        ].copy()
+
+        train_s1_ids = set(
+            train_s1["entity_id"].values
+        )
+
+        val_s1_ids = list(
+            val_s1["entity_id"].values
+        )
+
+        # --------------------------------------------------------------
+        # GROUND TRUTH
+        # --------------------------------------------------------------
+
+        print("Loading ground truth...")
+
+        all_sample_ids = set(
+            sample_s1["entity_id"].values
+        )
+
+        gt_dict = self._load_ground_truth(
+            con,
+            data_dir,
+            all_sample_ids,
+        )
+
+        train_gt_dict = {
+            s1_id: gt_dict.get(
+                s1_id,
+                set()
+            )
+            for s1_id in train_s1_ids
+        }
+
+        val_gt_dict = {
+            s1_id: gt_dict.get(
+                s1_id,
+                set()
+            )
+            for s1_id in val_s1_ids
+        }
+
+        print(
+            f"Ground-truth S1 entities: "
+            f"{len(gt_dict):,}"
+        )
+
+        # --------------------------------------------------------------
+        # IMPORTANT:
+        # FULL TARGET POPULATION
+        # --------------------------------------------------------------
+
+        print(
+            "\nLoading COMPLETE training target population..."
+        )
+
+        train_s2 = self._read_source(
+            con,
+            train_s2_path,
+        )
+
+        train_s3 = self._read_source(
+            con,
+            train_s3_path,
+        )
+
+        targets_df = pd.concat(
+            [
+                train_s2,
+                train_s3,
+            ],
+            ignore_index=True,
+        )
+
+        targets_df = targets_df.drop_duplicates(
+            subset=["entity_id"]
+        ).reset_index(drop=True)
+
+        print(
+            f"Full training targets: "
+            f"{len(targets_df):,}"
+        )
+
+        # --------------------------------------------------------------
+        # BUILD FULL COUNTRY INDEX
+        # --------------------------------------------------------------
+
+        index_start = time.time()
+
+        country_generators = (
+            self._build_country_generators(
+                targets_df
+            )
+        )
+
+        print(
+            f"Candidate indexes built in "
+            f"{time.time() - index_start:.2f}s"
+        )
+
+        # --------------------------------------------------------------
+        # TRAIN CANDIDATES
+        # --------------------------------------------------------------
+
+        print(
+            "\nGenerating TRAIN candidate pairs..."
+        )
+
+        train_pairs, _, train_recall = (
+            self._generate_pairs(
+                train_s1,
+                country_generators,
+                gt_dict=train_gt_dict,
+                collect_features=True,
+                calculate_recall=True,
+            )
+        )
+
+        print(
+            "\nTRAIN candidate recall:"
+        )
+
+        print(
+            f"  true matches : "
+            f"{train_recall['true_matches']:,}"
+        )
+
+        print(
+            f"  found        : "
+            f"{train_recall['found_matches']:,}"
+        )
+
+        print(
+            f"  recall       : "
+            f"{train_recall['candidate_recall']:.6f}"
+        )
+
+        if not train_pairs:
+            raise RuntimeError(
+                "No training candidate pairs were generated."
+            )
+
+        # --------------------------------------------------------------
+        # BUILD TRAIN MATRIX
+        # --------------------------------------------------------------
+
+        X_train = np.asarray(
+            [
+                record[2]
+                for record in train_pairs
+            ],
+            dtype=np.float32,
+        )
+
+        y_train = np.asarray(
+            [
+                record[3]
+                for record in train_pairs
+            ],
+            dtype=np.int8,
+        )
+
+        positives = int(y_train.sum())
+        negatives = int(
+            len(y_train) - positives
+        )
+
+        print(
+            "\nTraining dataset:"
+        )
+
+        print(
+            f"  pairs      : {len(y_train):,}"
+        )
+
+        print(
+            f"  positives  : {positives:,}"
+        )
+
+        print(
+            f"  negatives  : {negatives:,}"
+        )
+
+        print(
+            f"  pos ratio  : "
+            f"{positives / max(len(y_train), 1):.4f}"
+        )
+
+        # --------------------------------------------------------------
+        # TRAIN MODEL
+        # --------------------------------------------------------------
+
+        self.model = train_matching_model(
+            X_train,
+            y_train,
+            model_path=model_save_path,
+            feature_names=FEATURE_NAMES,
+        )
+
+        # --------------------------------------------------------------
+        # VALIDATION
+        # --------------------------------------------------------------
+
+        print(
+            "\nGenerating VALIDATION candidate pairs..."
+        )
+
+        val_pairs, _, val_recall = (
+            self._generate_pairs(
+                val_s1,
+                country_generators,
+                gt_dict=val_gt_dict,
+                collect_features=True,
+                calculate_recall=True,
+            )
+        )
+
+        print(
+            "\n===================================================="
+        )
+        print(
+            "VALIDATION CANDIDATE RECALL"
+        )
+        print(
+            "===================================================="
+        )
+
+        print(
+            f"True matches : "
+            f"{val_recall['true_matches']:,}"
+        )
+
+        print(
+            f"Found        : "
+            f"{val_recall['found_matches']:,}"
+        )
+
+        print(
+            f"Recall       : "
+            f"{val_recall['candidate_recall']:.6f}"
+        )
+
+        if val_recall["candidate_recall"] < 0.98:
+            print(
+                "\nWARNING:"
+            )
+            print(
+                "Candidate recall is below 98%."
+            )
+            print(
+                "The matcher cannot achieve 98% overall "
+                "F0.5 unless the blocker improves."
+            )
+
+        # --------------------------------------------------------------
+        # VALIDATION MATCHER
+        # --------------------------------------------------------------
+
+        best_threshold, best_f05 = (
+            self._find_best_threshold(
+                val_pairs,
+                val_gt_dict,
+                val_s1_ids,
+            )
+        )
+
+        self.threshold = best_threshold
+
+        print(
+            "\n===================================================="
+        )
+        print(
+            "VALIDATION RESULT"
+        )
+        print(
+            "===================================================="
+        )
+
+        print(
+            f"Best threshold : "
+            f"{best_threshold:.4f}"
+        )
+
+        print(
+            f"Macro F0.5     : "
+            f"{best_f05:.6f}"
+        )
+
+        print(
+            f"Training time  : "
+            f"{time.time() - t0:.2f}s"
+        )
+
+        print(
+            "\nModel and validation completed."
+        )
+
         return self.model
 
-    def predict_test(self, test_dir, output_dir, model_path=None):
-        """Run blocking and matching on full test set, country by country."""
-        print("=== Running End-to-End Prediction on Test Set ===")
+    # ------------------------------------------------------------------
+    # TEST PREDICTION
+    # ------------------------------------------------------------------
+
+    def predict_test(
+        self,
+        test_dir,
+        output_dir,
+        model_path=None,
+    ):
+
+        print(
+            "\n"
+            "====================================================\n"
+            "TEST PREDICTION\n"
+            "===================================================="
+        )
+
         t_start = time.time()
-        
+
         if self.model is None:
-            if model_path and os.path.exists(model_path):
-                print(f"Loading trained model from {model_path}...")
-                self.model = load_matching_model(model_path)
+
+            if (
+                model_path
+                and os.path.exists(model_path)
+            ):
+                self.model = load_matching_model(
+                    model_path
+                )
             else:
-                raise ValueError("Model not trained and model_path does not exist.")
-                
+                raise ValueError(
+                    "Model is not loaded."
+                )
+
+        os.makedirs(
+            output_dir,
+            exist_ok=True,
+        )
+
         con = duckdb.connect()
-        os.makedirs(output_dir, exist_ok=True)
-        
-        # 1. Load test_source1 metadata
-        s1_file = os.path.join(test_dir, "test_source1.tsv")
-        s2_file = os.path.join(test_dir, "test_source2.tsv")
-        s3_file = os.path.join(test_dir, "test_source3.tsv")
-        
-        print(f"Reading S1 entities from {s1_file}...")
-        s1_df = con.execute(f"SELECT entity_id, business_name, business_address, country FROM read_csv('{s1_file}', delim='\\t', header=True)").df()
-        all_s1_order = list(s1_df['entity_id'].values)
-        total_s1 = len(all_s1_order)
-        print(f"Total Source 1 test entities: {total_s1}")
-        
-        countries = list(s1_df['country'].unique())
-        print(f"Countries to process: {countries}")
-        
-        # Dictionaries to store outputs: s1_id -> list of IDs
-        matching_results = {s1: [] for s1 in all_s1_order}
-        candidate_pairs = {s1: [] for s1 in all_s1_order}
-        
-        # Process country by country to keep memory bounded and maximize cache locality
+
+        s1_path = os.path.join(
+            test_dir,
+            "test_source1.tsv",
+        )
+
+        s2_path = os.path.join(
+            test_dir,
+            "test_source2.tsv",
+        )
+
+        s3_path = os.path.join(
+            test_dir,
+            "test_source3.tsv",
+        )
+
+        # --------------------------------------------------------------
+        # LOAD S1
+        # --------------------------------------------------------------
+
+        print(
+            f"Reading {s1_path}"
+        )
+
+        s1_df = self._read_source(
+            con,
+            s1_path,
+        )
+
+        all_s1_order = list(
+            s1_df["entity_id"].values
+        )
+
+        print(
+            f"Total S1 entities: "
+            f"{len(all_s1_order):,}"
+        )
+
+        countries = list(
+            s1_df["country"]
+            .dropna()
+            .unique()
+        )
+
+        print(
+            f"Countries: {countries}"
+        )
+
+        matching_results = {
+            s1_id: []
+            for s1_id in all_s1_order
+        }
+
+        candidate_pairs = {
+            s1_id: []
+            for s1_id in all_s1_order
+        }
+
+        # --------------------------------------------------------------
+        # COUNTRY-BY-COUNTRY
+        # --------------------------------------------------------------
+
         for country in countries:
-            print(f"\n--- Processing Country: {country} ---")
-            t_c = time.time()
-            s1_country_df = s1_df[s1_df['country'] == country].reset_index(drop=True)
-            n_s1_country = len(s1_country_df)
-            print(f"Country {country}: {n_s1_country} Source 1 entities.")
-            
-            # Load targets for this country from S2 and S3
-            print(f"Loading Source 2 and Source 3 targets for {country}...")
-            targets_country_df = con.execute(f"""
-                SELECT entity_id, business_name, business_address, country
-                FROM read_csv('{s2_file}', delim='\\t', header=True)
+
+            country_start = time.time()
+
+            print(
+                "\n"
+                "----------------------------------------------------"
+            )
+
+            print(
+                f"COUNTRY: {country}"
+            )
+
+            print(
+                "----------------------------------------------------"
+            )
+
+            s1_country = s1_df[
+                s1_df["country"] == country
+            ].reset_index(drop=True)
+
+            if len(s1_country) == 0:
+                continue
+
+            # ----------------------------------------------------------
+            # TARGETS
+            # ----------------------------------------------------------
+
+            targets_country = con.execute(
+                f"""
+                SELECT
+                    entity_id,
+                    business_name,
+                    business_address,
+                    country
+                FROM read_csv(
+                    '{s2_path}',
+                    delim='\\t',
+                    header=True
+                )
                 WHERE country = '{country}'
+
                 UNION ALL
-                SELECT entity_id, business_name, business_address, country
-                FROM read_csv('{s3_file}', delim='\\t', header=True)
-                WHERE country = '{country}';
-            """).df()
-            print(f"Loaded {len(targets_country_df)} targets for {country} in {time.time() - t_c:.2f}s.")
-            
-            # Build inverted index
-            t_idx = time.time()
-            gen = CandidateGenerator(max_cand_per_key=100, default_top_k=self.top_k_candidates)
-            gen.fit(targets_country_df)
-            print(f"Index built for {country} in {time.time() - t_idx:.2f}s.")
-            
-            # Run inference in batches of S1 entities
+
+                SELECT
+                    entity_id,
+                    business_name,
+                    business_address,
+                    country
+                FROM read_csv(
+                    '{s3_path}',
+                    delim='\\t',
+                    header=True
+                )
+                WHERE country = '{country}'
+                """
+            ).df()
+
+            targets_country = (
+                targets_country
+                .drop_duplicates(
+                    subset=["entity_id"]
+                )
+                .reset_index(drop=True)
+            )
+
+            print(
+                f"S1: {len(s1_country):,}"
+            )
+
+            print(
+                f"S2/S3 targets: "
+                f"{len(targets_country):,}"
+            )
+
+            # ----------------------------------------------------------
+            # INDEX
+            # ----------------------------------------------------------
+
+            index_start = time.time()
+
+            generator = CandidateGenerator(
+                max_cand_per_key=100,
+                default_top_k=self.top_k_candidates,
+            )
+
+            generator.fit(
+                targets_country
+            )
+
+            print(
+                f"Index time: "
+                f"{time.time() - index_start:.2f}s"
+            )
+
+            # ----------------------------------------------------------
+            # INFERENCE
+            # ----------------------------------------------------------
+
             BATCH_SIZE = 10000
-            total_batches = math.ceil(n_s1_country / BATCH_SIZE)
-            
-            t_inf = time.time()
-            for b_idx in range(total_batches):
-                b_start = b_idx * BATCH_SIZE
-                b_end = min(b_start + BATCH_SIZE, n_s1_country)
-                batch_slice = s1_country_df.iloc[b_start:b_end]
-                
-                # Collect candidate pairs for this batch
+
+            n = len(s1_country)
+
+            total_batches = math.ceil(
+                n / BATCH_SIZE
+            )
+
+            inference_start = time.time()
+
+            for batch_idx in range(
+                total_batches
+            ):
+
+                start = (
+                    batch_idx
+                    * BATCH_SIZE
+                )
+
+                end = min(
+                    start + BATCH_SIZE,
+                    n,
+                )
+
+                batch = s1_country.iloc[
+                    start:end
+                ]
+
                 batch_pairs = []
-                for _, row in batch_slice.iterrows():
-                    s1_id = row['entity_id']
-                    s1_name = row['business_name']
-                    s1_addr = row['business_address']
-                    
-                    cands = gen.query(s1_name, s1_addr, top_k=self.top_k_candidates)
-                    cand_ids = [gen.t_ids[idx] for idx in cands]
-                    candidate_pairs[s1_id] = cand_ids
-                    
-                    for tid_idx in cands:
-                        tgt_id = gen.t_ids[tid_idx]
-                        tgt_name = gen.t_names[tid_idx]
-                        tgt_addr = gen.t_addrs[tid_idx]
-                        feats = extract_pair_features(s1_name, s1_addr, tgt_name, tgt_addr, tgt_id)
-                        batch_pairs.append((s1_id, tgt_id, feats))
-                        
-                # Score batch with model
+
+                for _, row in batch.iterrows():
+
+                    s1_id = row["entity_id"]
+
+                    s1_name = row[
+                        "business_name"
+                    ]
+
+                    s1_addr = row[
+                        "business_address"
+                    ]
+
+                    candidates = (
+                        generator.query(
+                            s1_name,
+                            s1_addr,
+                            top_k=self.top_k_candidates,
+                        )
+                    )
+
+                    candidate_ids = []
+
+                    for tid_idx in candidates:
+
+                        tgt_id = (
+                            generator.t_ids[
+                                tid_idx
+                            ]
+                        )
+
+                        candidate_ids.append(
+                            tgt_id
+                        )
+
+                        tgt_name = (
+                            generator.t_names[
+                                tid_idx
+                            ]
+                        )
+
+                        tgt_addr = (
+                            generator.t_addrs[
+                                tid_idx
+                            ]
+                        )
+
+                        features = (
+                            extract_pair_features(
+                                s1_name,
+                                s1_addr,
+                                tgt_name,
+                                tgt_addr,
+                                tgt_id,
+                            )
+                        )
+
+                        batch_pairs.append(
+                            (
+                                s1_id,
+                                tgt_id,
+                                features,
+                            )
+                        )
+
+                    candidate_pairs[
+                        s1_id
+                    ] = list(
+                        dict.fromkeys(
+                            candidate_ids
+                        )
+                    )
+
+                # ------------------------------------------------------
+                # SCORE
+                # ------------------------------------------------------
+
                 if batch_pairs:
-                    X_b = np.array([p[2] for p in batch_pairs], dtype=np.float32)
-                    probs = self.model.predict(X_b)
-                    
-                    for (s1_id, tgt_id, _), prob in zip(batch_pairs, probs):
-                        if prob >= self.threshold:
-                            matching_results[s1_id].append(tgt_id)
-                            
-                if (b_idx + 1) % 10 == 0 or (b_idx + 1) == total_batches:
-                    elapsed = time.time() - t_inf
-                    rate = b_end / elapsed
-                    eta = (n_s1_country - b_end) / rate if rate > 0 else 0
-                    print(f"  [{country}] Processed {b_end}/{n_s1_country} S1 entities ({b_end/n_s1_country*100:.1f}%) - {rate:.0f} ent/s - ETA: {eta:.0f}s")
-                    
-            del targets_country_df
-            del gen
-            print(f"Finished {country} in {time.time() - t_c:.2f}s.")
-            
-        # Write output files
-        matching_file = os.path.join(output_dir, "matching_results.tsv")
-        candidate_file = os.path.join(output_dir, "candidate_pairs.tsv")
-        
-        print(f"\nWriting matching results to {matching_file}...")
-        with open(matching_file, "w", encoding="utf-8") as f_m:
-            f_m.write("source1_entity_id\tmatched_entity_ids\n")
+
+                    X_batch = np.asarray(
+                        [
+                            pair[2]
+                            for pair in batch_pairs
+                        ],
+                        dtype=np.float32,
+                    )
+
+                    probabilities = (
+                        self.model.predict_proba(
+                            X_batch
+                        )
+                    )
+
+                    for pair, probability in zip(
+                        batch_pairs,
+                        probabilities,
+                    ):
+
+                        if (
+                            probability
+                            >= self.threshold
+                        ):
+
+                            matching_results[
+                                pair[0]
+                            ].append(
+                                pair[1]
+                            )
+
+                if (
+                    (batch_idx + 1) % 10 == 0
+                    or batch_idx + 1
+                    == total_batches
+                ):
+
+                    elapsed = (
+                        time.time()
+                        - inference_start
+                    )
+
+                    rate = (
+                        end / elapsed
+                        if elapsed > 0
+                        else 0
+                    )
+
+                    remaining = (
+                        n - end
+                    )
+
+                    eta = (
+                        remaining / rate
+                        if rate > 0
+                        else 0
+                    )
+
+                    print(
+                        f"[{country}] "
+                        f"{end:,}/{n:,} "
+                        f"({100 * end / n:.1f}%) "
+                        f"{rate:.0f} S1/s "
+                        f"ETA {eta:.0f}s"
+                    )
+
+            print(
+                f"Finished {country} in "
+                f"{time.time() - country_start:.2f}s"
+            )
+
+        # --------------------------------------------------------------
+        # CLEAN MATCHES
+        # --------------------------------------------------------------
+
+        for s1_id in matching_results:
+
+            matching_results[s1_id] = list(
+                dict.fromkeys(
+                    matching_results[s1_id]
+                )
+            )
+
+        # --------------------------------------------------------------
+        # WRITE MATCHING
+        # --------------------------------------------------------------
+
+        matching_path = os.path.join(
+            output_dir,
+            "matching_results.tsv",
+        )
+
+        candidate_path = os.path.join(
+            output_dir,
+            "candidate_pairs.tsv",
+        )
+
+        print(
+            f"\nWriting {matching_path}"
+        )
+
+        with open(
+            matching_path,
+            "w",
+            encoding="utf-8",
+        ) as f:
+
+            f.write(
+                "source1_entity_id\t"
+                "matched_entity_ids\n"
+            )
+
             for s1_id in all_s1_order:
-                m_list = matching_results[s1_id]
-                # Ensure no duplicates within list and strictly valid
-                m_list_unique = list(dict.fromkeys(m_list))
-                f_m.write(f"{s1_id}\t{','.join(m_list_unique)}\n")
-                
-        print(f"Writing candidate pairs to {candidate_file}...")
-        with open(candidate_file, "w", encoding="utf-8") as f_c:
-            f_c.write("source1_entity_id\tcandidate_entity_ids\n")
+
+                matches = matching_results[
+                    s1_id
+                ]
+
+                f.write(
+                    f"{s1_id}\t"
+                    f"{','.join(matches)}\n"
+                )
+
+        # --------------------------------------------------------------
+        # WRITE CANDIDATES
+        # --------------------------------------------------------------
+
+        print(
+            f"Writing {candidate_path}"
+        )
+
+        with open(
+            candidate_path,
+            "w",
+            encoding="utf-8",
+        ) as f:
+
+            f.write(
+                "source1_entity_id\t"
+                "candidate_entity_ids\n"
+            )
+
             for s1_id in all_s1_order:
-                c_list = candidate_pairs[s1_id]
-                # Guarantee matching IDs are always included in candidate set
-                m_list = matching_results[s1_id]
-                all_candidates = list(dict.fromkeys(c_list + m_list))
-                f_c.write(f"{s1_id}\t{','.join(all_candidates)}\n")
-                
-        total_time = time.time() - t_start
-        print(f"=== All Test Predictions Finished in {total_time/60:.2f} minutes ===")
-        return matching_file, candidate_file
+
+                candidates = candidate_pairs[
+                    s1_id
+                ]
+
+                f.write(
+                    f"{s1_id}\t"
+                    f"{','.join(candidates)}\n"
+                )
+
+        elapsed_total = (
+            time.time() - t_start
+        )
+
+        print(
+            "\n===================================================="
+        )
+
+        print(
+            "PREDICTION COMPLETE"
+        )
+
+        print(
+            f"Runtime: "
+            f"{elapsed_total / 60:.2f} minutes"
+        )
+
+        print(
+            f"Matching: {matching_path}"
+        )
+
+        print(
+            f"Candidates: {candidate_path}"
+        )
+
+        return (
+            matching_path,
+            candidate_path,
+        )
